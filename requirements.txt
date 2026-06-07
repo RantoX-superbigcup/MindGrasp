@@ -1,0 +1,4 @@
+﻿PyQt5>=5.15
+numpy>=1.20
+requests>=2.28
+pyserial>=3.5
