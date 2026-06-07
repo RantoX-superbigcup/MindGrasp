@@ -1,4 +1,4 @@
-﻿# Python cache
+# Python cache
 __pycache__/
 *.py[cod]
 *.pyo
@@ -41,3 +41,9 @@ weights/
 Thumbs.db
 ~$*.doc
 ~$*.docx
+# Keep weight directories documented, but do not commit binary checkpoints
+weights/**
+!weights/
+!weights/graspnet/
+!weights/graspnet/README.md
+!weights/graspnet/.gitkeep

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import uuid
 from pathlib import Path
@@ -30,6 +30,8 @@ class EmbodiedPickPipeline:
             config.robot_port,
             config.robot_baudrate,
             config.robot_protocol,
+            disabled_joints=config.robot_disabled_joints,
+            home_angles=config.robot_home_angles,
         )
         self.context = TaskContext(task_id=self._new_task_id())
 

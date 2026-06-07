@@ -31,10 +31,12 @@ python .\run_embodied_demo.py --config .\configs\default_config.json --command E
 
 ## 接入真实 GraspNet
 
-1. 确认 `graspnet_root` 指向 `E:\平时\生医工\命题脑机接口一队\模型\graspnet_baseline\graspnet-baseline`。
-2. 设置 `graspnet_checkpoint` 为真实 `checkpoint.tar` 路径。
-3. 输入帧目录需要包含 `color.png`、`depth.png`、`workspace_mask.png`、`meta.mat`。
+1. GraspNet baseline 源码随本仓库放在 `third_party/graspnet-baseline/`。
+2. 将官方预训练权重放到 `weights/graspnet/checkpoint-rs.tar`。
+3. 将 `configs/default_config.json` 中的 `dry_run` 改成 `false`。
+4. 确认 RGB-D 输入目录包含 `color.png`、`depth.png`、`workspace_mask.png`、`meta.mat`。
 
+权重文件不直接提交到 Git，避免仓库过大。需要共享时建议使用 GitHub Releases、网盘或 Git LFS。
 ## 接入机械臂
 
 当前 Arduino 代码接收 `<beta1;L4>`，因此框架里的 `SerialArmController` 会把抓取候选位置转换成 `beta` 和 `L4` 后通过串口发送。
