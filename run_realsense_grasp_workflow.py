@@ -21,6 +21,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 import run_target_grasp_demo as target_demo
 from capture_realsense_rgbd import capture as capture_realsense
+from arm_control.transform import ArmCommandConfig, compute_arm_command, compute_arm_command_from_base_point, parse_matrix3, parse_vector, transform_camera_point_to_base
 
 
 def image_to_data_url(path: Path) -> str:
@@ -147,6 +148,262 @@ def choose_interactively(options_result: Dict[str, Any]) -> str:
         print(f"无效选项：{choice}。可选：{', '.join(sorted(keys))}")
 
 
+
+def normalize_place_options(result: Dict[str, Any], width: int, height: int, max_places: int) -> Dict[str, Any]:
+    raw_options = result.get("places") or result.get("options") or []
+    normalized: List[Dict[str, Any]] = []
+    for idx, option in enumerate(raw_options[:max_places]):
+        bbox = target_demo.normalize_bbox(option.get("bbox"), width, height)
+        if bbox is None:
+            continue
+        key = str(option.get("key") or f"P{idx + 1}").upper().strip()
+        if not key.startswith("P"):
+            key = f"P{idx + 1}"
+        normalized.append(
+            {
+                "key": key,
+                "label": str(option.get("label") or f"place_{idx + 1}"),
+                "target_id": str(option.get("target_id") or option.get("label") or f"place_{idx + 1}").lower().replace(" ", "_"),
+                "description": str(option.get("description") or option.get("label") or f"place_{idx + 1}"),
+                "bbox": bbox,
+                "confidence": float(option.get("confidence", 0.0) or 0.0),
+            }
+        )
+    return {
+        "image_width": width,
+        "image_height": height,
+        "question": str(result.get("question") or "Choose a placement region"),
+        "options": normalized,
+        "raw_content": result.get("raw_content", ""),
+    }
+
+
+def create_place_context_image(frame_dir: Path, options_result: Dict[str, Any], selected: Dict[str, Any], output_path: Path) -> Path:
+    from PIL import Image, ImageDraw
+
+    color_path = frame_dir / "color.png"
+    depth_path = frame_dir / "depth.png"
+    color = Image.open(color_path).convert("RGB")
+    width, height = color.size
+    color_draw = ImageDraw.Draw(color)
+    selected_bbox = selected.get("bbox")
+    if selected_bbox:
+        x1, y1, x2, y2 = [int(v) for v in selected_bbox]
+        color_draw.rectangle([x1, y1, x2, y2], outline=(255, 60, 40), width=4)
+        color_draw.text((x1, max(0, y1 - 18)), "selected target", fill=(255, 60, 40))
+
+    if depth_path.exists():
+        depth = np.asarray(Image.open(depth_path), dtype=np.float32)
+        valid = depth > 0
+        if np.any(valid):
+            lo = float(np.percentile(depth[valid], 2))
+            hi = float(np.percentile(depth[valid], 98))
+            if hi <= lo:
+                hi = lo + 1.0
+            norm = np.clip((depth - lo) / (hi - lo), 0.0, 1.0)
+            gray = (norm * 255).astype(np.uint8)
+            depth_rgb = np.stack([gray, 255 - gray, np.zeros_like(gray)], axis=-1)
+            depth_rgb[~valid] = np.array([0, 0, 0], dtype=np.uint8)
+        else:
+            depth_rgb = np.zeros((height, width, 3), dtype=np.uint8)
+        depth_img = Image.fromarray(depth_rgb, mode="RGB")
+    else:
+        depth_img = Image.new("RGB", (width, height), (0, 0, 0))
+
+    context = Image.new("RGB", (width * 2, height), (20, 20, 20))
+    context.paste(color, (0, 0))
+    context.paste(depth_img, (width, 0))
+    draw = ImageDraw.Draw(context)
+    draw.rectangle([0, 0, width - 1, height - 1], outline=(255, 255, 255), width=2)
+    draw.rectangle([width, 0, width * 2 - 1, height - 1], outline=(255, 255, 255), width=2)
+    draw.text((12, 12), "LEFT: RGB, bbox coords use this image only", fill=(255, 255, 0))
+    draw.text((width + 12, 12), "RIGHT: depth preview, nearer/farther shown by color", fill=(255, 255, 0))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    context.save(output_path)
+    return output_path
+
+
+def call_qwen_place_options(
+    context_path: Path,
+    selected: Dict[str, Any],
+    width: int,
+    height: int,
+    base_url: str,
+    model: str,
+    api_key: str,
+    max_places: int,
+) -> Dict[str, Any]:
+    import requests
+
+    prompt = f"""
+You are selecting safe placement regions for a tabletop robotic arm.
+The image is a side-by-side RGB-D context. LEFT is the RGB image, RIGHT is depth preview.
+Return exactly {max_places} candidate empty tabletop placement regions.
+All bbox coordinates must refer to the LEFT RGB image only, with width={width}, height={height}.
+Avoid the selected target, occupied objects, robot body, table edges, shadows, and unreachable-looking corners.
+Selected target: key={selected.get('key')}, label={selected.get('label')}, description={selected.get('description')}, bbox={selected.get('bbox')}.
+
+Return strict JSON only:
+{{
+  "question": "Choose placement region",
+  "places": [
+    {{"key": "P1", "label": "left empty area", "description": "empty tabletop area left of objects", "bbox": [x1,y1,x2,y2], "confidence": 0.0}}
+  ]
+}}
+""".strip()
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": image_to_data_url(context_path)}},
+                ],
+            }
+        ],
+        "temperature": 0.1,
+    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    response = requests.post(base_url, headers=headers, json=payload, timeout=90)
+    response.raise_for_status()
+    content = response.json()["choices"][0]["message"]["content"]
+    result = target_demo.extract_json(content)
+    result["raw_content"] = content
+    return normalize_place_options(result, width, height, max_places)
+
+
+def load_rgbd_geometry(frame_dir: Path) -> Dict[str, Any]:
+    from PIL import Image
+
+    info_path = frame_dir / "camera_info.json"
+    if not info_path.exists():
+        raise FileNotFoundError(f"Missing camera_info.json: {info_path}")
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    depth_path = frame_dir / "depth.png"
+    if not depth_path.exists():
+        raise FileNotFoundError(f"Missing depth image: {depth_path}")
+    depth = np.asarray(Image.open(depth_path), dtype=np.uint16)
+    intrinsic = np.asarray(info["intrinsic_matrix"], dtype=float)
+    depth_scale = float(info.get("depth_scale_m_per_unit") or (1.0 / float(info["factor_depth"])))
+    return {"depth": depth, "intrinsic": intrinsic, "depth_scale": depth_scale, "info": info}
+
+
+def point_from_depth_bbox(frame_dir: Path, bbox: List[int]) -> Dict[str, Any]:
+    geom = load_rgbd_geometry(frame_dir)
+    depth = geom["depth"]
+    intrinsic = geom["intrinsic"]
+    depth_scale = geom["depth_scale"]
+    height, width = depth.shape[:2]
+    x1, y1, x2, y2 = target_demo.normalize_bbox(bbox, width, height) or bbox
+    cx = int(round((x1 + x2) / 2.0))
+    cy = int(round((y1 + y2) / 2.0))
+
+    # Use the central area first to avoid object/edge pixels in a large placement bbox.
+    shrink_x = max(2, int((x2 - x1) * 0.25))
+    shrink_y = max(2, int((y2 - y1) * 0.25))
+    rx1 = min(max(0, x1 + shrink_x), width - 1)
+    rx2 = min(max(rx1 + 1, x2 - shrink_x), width)
+    ry1 = min(max(0, y1 + shrink_y), height - 1)
+    ry2 = min(max(ry1 + 1, y2 - shrink_y), height)
+    region = depth[ry1:ry2, rx1:rx2]
+    valid = region[region > 0]
+    if valid.size == 0:
+        region = depth[max(0, y1):min(height, y2 + 1), max(0, x1):min(width, x2 + 1)]
+        valid = region[region > 0]
+    if valid.size == 0:
+        raise RuntimeError(f"No valid depth inside placement bbox: {bbox}")
+
+    z_m = float(np.median(valid) * depth_scale)
+    fx, fy = float(intrinsic[0, 0]), float(intrinsic[1, 1])
+    ppx, ppy = float(intrinsic[0, 2]), float(intrinsic[1, 2])
+    x_m = (float(cx) - ppx) * z_m / fx
+    y_m = (float(cy) - ppy) * z_m / fy
+    return {
+        "point_camera_m": [x_m, y_m, z_m],
+        "uv": [cx, cy],
+        "bbox": [int(x1), int(y1), int(x2), int(y2)],
+        "depth_m": z_m,
+        "valid_depth_pixels": int(valid.size),
+    }
+
+
+def resolve_place_selection(
+    frame_dir: Path,
+    options_result: Dict[str, Any],
+    target_choice: str,
+    args: argparse.Namespace,
+    run_dir: Path,
+) -> Optional[Dict[str, Any]]:
+    if args.place_mode == "off":
+        return None
+
+    selected_target = target_demo.choose_option(options_result, target_choice)
+    width = int(options_result.get("image_width") or 0)
+    height = int(options_result.get("image_height") or 0)
+    if width <= 0 or height <= 0:
+        from PIL import Image
+        width, height = Image.open(frame_dir / "color.png").size
+
+    if args.place_mode == "manual":
+        if args.place_point_camera_m:
+            point = parse_vector(args.place_point_camera_m, 3, "place_point_camera_m").tolist()
+            place_result = {
+                "selected_place": {
+                    "key": args.place_choice or "P0",
+                    "label": "manual_camera_point",
+                    "description": "manual camera-frame point",
+                    "bbox": None,
+                },
+                "point": {"point_camera_m": point, "uv": None, "bbox": None, "depth_m": point[2], "valid_depth_pixels": 0},
+                "options": None,
+                "mode": "manual_point",
+            }
+        elif args.place_bbox:
+            bbox = target_demo.normalize_bbox([float(v.strip()) for v in args.place_bbox.split(",")], width, height)
+            if bbox is None:
+                raise ValueError("--place-bbox must be x1,y1,x2,y2")
+            selected_place = {"key": args.place_choice or "P0", "label": "manual_bbox", "description": "manual placement bbox", "bbox": bbox}
+            place_result = {
+                "selected_place": selected_place,
+                "point": point_from_depth_bbox(frame_dir, bbox),
+                "options": {"question": "manual placement", "options": [selected_place], "image_width": width, "image_height": height},
+                "mode": "manual_bbox",
+            }
+        else:
+            raise ValueError("--place-mode manual needs --place-bbox or --place-point-camera-m")
+    else:
+        api_key = os.getenv(args.api_key_env, "")
+        if not api_key:
+            raise RuntimeError(f"--place-mode qwen needs API key. Set: $env:{args.api_key_env}=\"your_key\"")
+        context_path = create_place_context_image(frame_dir, options_result, selected_target, run_dir / "place_context_rgbd.png")
+        place_options = call_qwen_place_options(
+            context_path=context_path,
+            selected=selected_target,
+            width=width,
+            height=height,
+            base_url=args.qwen_base_url,
+            model=args.qwen_model,
+            api_key=api_key,
+            max_places=args.max_place_options,
+        )
+        target_demo.write_json(run_dir / "place_options.json", {"place_options": place_options})
+        target_demo.draw_options_overlay(frame_dir / "color.png", place_options, run_dir / "place_options_overlay.png")
+        print_options(place_options)
+        place_choice = args.place_choice.upper().strip() if args.place_choice else choose_interactively(place_options)
+        selected_place = target_demo.choose_option(place_options, place_choice)
+        place_result = {
+            "selected_place": selected_place,
+            "point": point_from_depth_bbox(frame_dir, selected_place["bbox"]),
+            "options": place_options,
+            "mode": "qwen",
+            "context_image": str(context_path),
+        }
+
+    target_demo.write_json(run_dir / "place_selection.json", place_result)
+    return place_result
+
+
 def build_capture_args(args: argparse.Namespace) -> SimpleNamespace:
     return SimpleNamespace(
         output_dir=str(PROJECT_ROOT / args.capture_output_dir),
@@ -243,12 +500,225 @@ def build_pose_output(summary: Dict[str, Any], camera_frame_id: str) -> Dict[str
     }
 
 
+
+def build_arm_config(args: argparse.Namespace) -> ArmCommandConfig:
+    return ArmCommandConfig(
+        camera_to_base_R=parse_matrix3(args.camera_to_base_rotation, "camera_to_base_rotation"),
+        camera_to_base_t_m=parse_vector(args.camera_to_base_translation_m, 3, "camera_to_base_translation_m"),
+        l1_mm=args.arm_l1_mm,
+        l2_mm=args.arm_l2_mm,
+        standoff_mm=args.arm_standoff_mm,
+        approach_axis=args.arm_approach_axis,
+        yaw_min_deg=args.arm_yaw_min_deg,
+        yaw_max_deg=args.arm_yaw_max_deg,
+    )
+
+
+def build_arm_command_output(pose_output: Dict[str, Any], args: argparse.Namespace) -> Dict[str, Any]:
+    if args.arm_mode == "off":
+        return {
+            "schema_version": "intentgrasp.arm_command.v1",
+            "status": "disabled",
+            "reason": "arm_mode=off",
+        }
+    if pose_output.get("status") != "pose_ready_camera_frame":
+        return {
+            "schema_version": "intentgrasp.arm_command.v1",
+            "status": "no_pose",
+            "reason": pose_output.get("reason", pose_output.get("status", "unknown")),
+        }
+    grasp_pose = pose_output.get("grasp_pose", {})
+    arm_output = compute_arm_command(
+        position_m=grasp_pose["position_m"],
+        quaternion_xyzw=grasp_pose["quaternion_xyzw"],
+        config=build_arm_config(args),
+    )
+    arm_output["mode"] = args.arm_mode
+    arm_output["source_pose_status"] = pose_output.get("status")
+    return arm_output
+
+
+def execute_arm_command_if_needed(arm_output: Dict[str, Any], args: argparse.Namespace) -> Dict[str, Any]:
+    if args.arm_mode != "serial":
+        return {
+            "mode": args.arm_mode,
+            "sent": False,
+            "reason": "serial execution disabled",
+        }
+    if not arm_output.get("reachable"):
+        return {
+            "mode": "serial",
+            "sent": False,
+            "success": False,
+            "reason": f"command not reachable: {arm_output.get('reason')}",
+        }
+    packet = str(arm_output.get("packet") or "")
+    if not packet:
+        return {
+            "mode": "serial",
+            "sent": False,
+            "success": False,
+            "reason": "empty packet",
+        }
+
+    from arm_control.serial_link import ArmLink
+
+    arm = ArmLink(port=args.arm_port, baud=args.arm_baud, disable_reset=args.arm_disable_reset)
+    try:
+        ok, log = arm.send_and_wait(packet, timeout=args.arm_timeout)
+    finally:
+        arm.close()
+    return {
+        "mode": "serial",
+        "sent": True,
+        "success": bool(ok),
+        "packet": packet,
+        "port": args.arm_port,
+        "baud": int(args.arm_baud),
+        "log": log,
+        "reason": "done" if ok else "error_or_timeout",
+    }
+
+
+
+def config_with_standoff(config: ArmCommandConfig, standoff_mm: float) -> ArmCommandConfig:
+    return ArmCommandConfig(
+        camera_to_base_R=config.camera_to_base_R,
+        camera_to_base_t_m=config.camera_to_base_t_m,
+        l1_mm=config.l1_mm,
+        l2_mm=config.l2_mm,
+        standoff_mm=standoff_mm,
+        approach_axis=config.approach_axis,
+        yaw_min_deg=config.yaw_min_deg,
+        yaw_max_deg=config.yaw_max_deg,
+    )
+
+
+def build_gripper_step(name: str, angle_deg: float) -> Dict[str, Any]:
+    return {
+        "name": name,
+        "kind": "gripper",
+        "packet": "<G %.1f>" % float(angle_deg),
+        "reachable": True,
+        "status": "ready_to_send",
+    }
+
+
+def motion_step(name: str, command: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "name": name,
+        "kind": "motion",
+        "packet": command.get("packet"),
+        "reachable": bool(command.get("reachable")),
+        "status": command.get("status"),
+        "reason": command.get("reason"),
+        "command": command.get("command"),
+        "transform": command.get("transform"),
+    }
+
+
+def build_pick_place_plan(
+    pose_output: Dict[str, Any],
+    arm_output: Dict[str, Any],
+    place_result: Optional[Dict[str, Any]],
+    args: argparse.Namespace,
+) -> Optional[Dict[str, Any]]:
+    if place_result is None:
+        return None
+    if pose_output.get("status") != "pose_ready_camera_frame":
+        return {
+            "schema_version": "intentgrasp.pick_place_plan.v1",
+            "status": "no_pick_pose",
+            "reason": pose_output.get("reason", "no pose"),
+            "steps": [],
+        }
+
+    config = build_arm_config(args)
+    grasp_pose = pose_output["grasp_pose"]
+    pick_grasp = compute_arm_command(
+        position_m=grasp_pose["position_m"],
+        quaternion_xyzw=grasp_pose["quaternion_xyzw"],
+        config=config_with_standoff(config, 0.0),
+    )
+    pick_elbow = int(pick_grasp.get("command", {}).get("elbow", 1))
+    grasp_base = np.asarray(pick_grasp.get("transform", {}).get("grasp_base_m"), dtype=float)
+    lift_base = grasp_base + np.array([0.0, 0.0, float(args.post_grasp_lift_mm) / 1000.0])
+    pick_lift = compute_arm_command_from_base_point(lift_base, config, elbow=pick_elbow, label="post_grasp_lift")
+
+    place_point_camera = np.asarray(place_result["point"]["point_camera_m"], dtype=float)
+    place_surface_base = transform_camera_point_to_base(place_point_camera, config)
+    place_elbow = int(args.place_elbow)
+    hover_base = place_surface_base + np.array([0.0, 0.0, float(args.place_hover_mm) / 1000.0])
+    release_base = place_surface_base + np.array([0.0, 0.0, float(args.place_release_height_mm) / 1000.0])
+    place_hover = compute_arm_command_from_base_point(hover_base, config, elbow=place_elbow, label="place_hover")
+    place_release = compute_arm_command_from_base_point(release_base, config, elbow=place_elbow, label="place_release")
+
+    steps = [
+        motion_step("move_pregrasp", arm_output),
+        motion_step("move_grasp", pick_grasp),
+        build_gripper_step("close_gripper", args.gripper_close_deg),
+        motion_step("lift_after_grasp", pick_lift),
+        motion_step("move_place_hover", place_hover),
+        motion_step("move_place_release", place_release),
+        build_gripper_step("open_gripper", args.gripper_open_deg),
+        motion_step("retreat_after_place", place_hover),
+    ]
+    unreachable = [step for step in steps if step.get("kind") == "motion" and not step.get("reachable")]
+    status = "ready_to_send" if not unreachable else "not_reachable"
+    return {
+        "schema_version": "intentgrasp.pick_place_plan.v1",
+        "status": status,
+        "reason": "ok" if not unreachable else "unreachable motion steps: " + ",".join(step["name"] for step in unreachable),
+        "selected_place": place_result.get("selected_place"),
+        "place_point": place_result.get("point"),
+        "steps": steps,
+        "safety_note": "Serial execution sends packets in order. Validate calibration and gripper angles before using --arm-mode serial.",
+    }
+
+
+def execute_packet_plan_if_needed(plan: Optional[Dict[str, Any]], args: argparse.Namespace) -> Optional[Dict[str, Any]]:
+    if plan is None:
+        return None
+    if args.arm_mode != "serial":
+        return {
+            "mode": args.arm_mode,
+            "sent": False,
+            "reason": "serial execution disabled",
+        }
+    if plan.get("status") != "ready_to_send":
+        return {
+            "mode": "serial",
+            "sent": False,
+            "success": False,
+            "reason": plan.get("reason", "plan not ready"),
+        }
+
+    from arm_control.serial_link import ArmLink
+
+    logs: List[Dict[str, Any]] = []
+    arm = ArmLink(port=args.arm_port, baud=args.arm_baud, disable_reset=args.arm_disable_reset)
+    try:
+        for step in plan.get("steps", []):
+            packet = step.get("packet")
+            if not packet:
+                continue
+            done_key = "Gripper set" if step.get("kind") == "gripper" else "Traj done"
+            ok, log = arm.send_and_wait(packet, done_key=done_key, timeout=args.arm_timeout)
+            logs.append({"step": step.get("name"), "packet": packet, "success": bool(ok), "log": log})
+            if not ok:
+                return {"mode": "serial", "sent": True, "success": False, "reason": f"step failed: {step.get('name')}", "log": logs}
+    finally:
+        arm.close()
+    return {"mode": "serial", "sent": True, "success": True, "reason": "done", "log": logs}
+
+
 def run_grasp_pipeline(
     frame_dir: Path,
     options_result: Dict[str, Any],
     choice: str,
     args: argparse.Namespace,
     run_dir: Path,
+    place_result: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     target_demo.prepare_huggingface_cache(PROJECT_ROOT)
     target_demo.prepare_windows_dll_paths()
@@ -300,14 +770,22 @@ def run_grasp_pipeline(
         "top_grasps": target_demo.summarize_grasps(filtered, filtered_uv, args.top_k),
     }
     pose_output = build_pose_output(summary, args.camera_frame_id)
+    arm_output = build_arm_command_output(pose_output, args)
+    pick_place_plan = build_pick_place_plan(pose_output, arm_output, place_result, args)
     result = {
         "frame_dir": str(frame_dir),
         "options": options_result,
         "grasp_summary": summary,
         "robot_pose_output": pose_output,
+        "arm_command": arm_output,
+        "place_selection": place_result,
+        "pick_place_plan": pick_place_plan,
     }
     target_demo.write_json(run_dir / "workflow_result.json", result)
     target_demo.write_json(run_dir / "grasp_pose.json", pose_output)
+    target_demo.write_json(run_dir / "arm_command.json", arm_output)
+    if pick_place_plan is not None:
+        target_demo.write_json(run_dir / "pick_place_plan.json", pick_place_plan)
     target_demo.write_json(run_dir / "target_grasps.json", summary)
 
     if not args.no_vis:
@@ -378,6 +856,33 @@ def main() -> None:
     parser.add_argument("--collision-thresh", type=float, default=0.01)
     parser.add_argument("--voxel-size", type=float, default=0.01)
     parser.add_argument("--camera-frame-id", default="camera_color_optical_frame")
+
+    parser.add_argument("--arm-mode", choices=["off", "command", "serial"], default="command", help="off=no arm output, command=write arm_command.json only, serial=send to Arduino after pose generation.")
+    parser.add_argument("--arm-port", default="COM3")
+    parser.add_argument("--arm-baud", type=int, default=115200)
+    parser.add_argument("--arm-disable-reset", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--arm-timeout", type=float, default=8.0)
+    parser.add_argument("--arm-standoff-mm", type=float, default=40.0)
+    parser.add_argument("--arm-approach-axis", type=int, default=0)
+    parser.add_argument("--arm-l1-mm", type=float, default=100.0)
+    parser.add_argument("--arm-l2-mm", type=float, default=100.0)
+    parser.add_argument("--arm-yaw-min-deg", type=float, default=-90.0)
+    parser.add_argument("--arm-yaw-max-deg", type=float, default=90.0)
+    parser.add_argument("--camera-to-base-rotation", default="0,0,1;-1,0,0;0,-1,0", help="3x3 R_bc as rows separated by ';'. Default maps RealSense optical frame to base X-forward/Y-left/Z-up.")
+    parser.add_argument("--camera-to-base-translation-m", default="0,0,0", help="Camera origin in robot base frame, meters: x,y,z. Must be calibrated before serial execution.")
+
+    parser.add_argument("--place-mode", choices=["off", "qwen", "manual"], default="off", help="off=no placement planning, qwen=ask Qwen for 3 placement regions, manual=use --place-bbox or --place-point-camera-m.")
+    parser.add_argument("--place-choice", help="Placement option key, e.g. P1. If omitted in qwen mode, ask interactively.")
+    parser.add_argument("--max-place-options", type=int, default=3)
+    parser.add_argument("--place-bbox", help="Manual placement bbox in RGB pixels: x1,y1,x2,y2.")
+    parser.add_argument("--place-point-camera-m", help="Manual placement point in camera frame meters: x,y,z.")
+    parser.add_argument("--place-hover-mm", type=float, default=60.0)
+    parser.add_argument("--place-release-height-mm", type=float, default=20.0)
+    parser.add_argument("--post-grasp-lift-mm", type=float, default=60.0)
+    parser.add_argument("--place-elbow", type=int, default=1, choices=[-1, 1])
+    parser.add_argument("--gripper-open-deg", type=float, default=60.0)
+    parser.add_argument("--gripper-close-deg", type=float, default=120.0)
+
     parser.add_argument("--vis-mode", choices=["target", "compare"], default="compare")
     parser.add_argument("--no-vis", action="store_true")
     args = parser.parse_args()
@@ -411,14 +916,35 @@ def main() -> None:
     target_demo.draw_options_overlay(rgb_path, options_result, run_dir / "qwen_options_overlay.png")
     print_options(options_result)
     choice = args.choice.upper().strip() if args.choice else choose_interactively(options_result)
+    place_result = resolve_place_selection(frame_dir, options_result, choice, args, run_dir)
 
-    print(f"[workflow] 选择目标：{choice}")
-    result = run_grasp_pipeline(frame_dir, options_result, choice, args, run_dir)
+    print(f"[workflow] selected target: {choice}")
+    result = run_grasp_pipeline(frame_dir, options_result, choice, args, run_dir, place_result=place_result)
+    if result.get("pick_place_plan") is not None:
+        arm_execution = execute_packet_plan_if_needed(result.get("pick_place_plan"), args)
+    else:
+        arm_execution = execute_arm_command_if_needed(result.get("arm_command", {}), args)
+    result["arm_execution"] = arm_execution
+    target_demo.write_json(run_dir / "workflow_result.json", result)
+    target_demo.write_json(run_dir / "arm_execution.json", arm_execution or {})
+
     pose_path = run_dir / "grasp_pose.json"
-    print("\n[done] 完整流程结束")
+    arm_path = run_dir / "arm_command.json"
+    pick_place_path = run_dir / "pick_place_plan.json"
+    print()
+    print("[done] workflow finished")
     print(f"[saved] {run_dir}")
     print(f"[pose]  {pose_path}")
+    print(f"[arm]   {arm_path}")
+    if result.get("pick_place_plan") is not None:
+        print(f"[plan]  {pick_place_path}")
     print(json.dumps(result["robot_pose_output"], ensure_ascii=False, indent=2))
+    print(json.dumps(result.get("arm_command", {}), ensure_ascii=False, indent=2))
+    if result.get("pick_place_plan") is not None:
+        print(json.dumps(result.get("pick_place_plan", {}), ensure_ascii=False, indent=2))
+    if args.arm_mode == "serial":
+        print(json.dumps(arm_execution, ensure_ascii=False, indent=2))
+
 
 
 if __name__ == "__main__":

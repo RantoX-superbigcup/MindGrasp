@@ -310,65 +310,99 @@ RGB/RGB-D 场景输入
 
 项目中应把 GraspNet 理解为“抓取候选生成器”，而不是语言理解模型、目标选择模型或端到端机械臂控制模型。
 
-## 自制机械臂串口协议
+## Arm Serial Chain
 
-当前机械臂采用 1-5 号电机角度控制，角度单位为度，范围为 0-180。根据最新确认的编号，电机含义固定为：
-
-| 编号 | 位置 | 作用 |
-|---|---|---|
-| 1号 | 腕部 | 控制夹爪整体姿态/旋转 |
-| 2号 | 夹爪 | 控制夹爪张开/闭合 |
-| 3号 | 小臂 | 控制小臂伸展/俯仰 |
-| 4号 | 大臂 | 控制大臂抬起/放下 |
-| 5号 | 底座 | 控制整条机械臂水平旋转 |
-
-当前建议把坏电机位置放到 1 号腕部。这样 2 号夹爪仍然可用，抓取闭合动作可以保留；1 号腕部先固定在 home 角度即可。
-
-推荐协议：
+The project now uses the Cartesian firmware protocol from `firmware/arm_control_v2/arm_control_v2.ino`.
 
 ```text
-<J;motor1;motor2;motor3;motor4;motor5>
+PC / run_realsense_grasp_workflow.py
+-> grasp_pose.json                         # camera-frame 6D grasp pose
+-> arm_control.compute_arm_command()
+-> arm_command.json                        # firmware packet preview
+-> optional serial send to Arduino
 ```
 
-示例：
+Firmware packet:
 
 ```text
-<J;90;45;80;110;90>
+<C r;h;yaw;elbow>
 ```
 
-含义：
+Fields:
 
 ```text
-motor1 = 90   # 腕部，占位/固定；当前坏位默认放这里
-motor2 = 45   # 夹爪开合
-motor3 = 80   # 小臂
-motor4 = 110  # 大臂
-motor5 = 90   # 底座水平旋转
+r     = planar reach in mm
+h     = planar height in mm
+yaw   = base yaw in degrees, expected range [-90, 90]
+elbow = 1 for elbow-up, -1 for elbow-down
 ```
 
-紧急停止协议：
+Default workflow behavior is safe: it only writes `arm_command.json` and does not move the real arm.
+
+```powershell
+python -B .\run_realsense_grasp_workflow.py --arm-mode command
+```
+
+To actually send the packet to Arduino, use `serial` mode explicitly:
+
+```powershell
+python -B .\run_realsense_grasp_workflow.py --arm-mode serial --arm-port COM3 --no-vis
+```
+
+Before using `--arm-mode serial`, calibrate the camera-to-base transform. The default transform only maps RealSense optical axes to a conventional robot base frame; its translation is `0,0,0`, so it is not physically correct for your setup.
+
+```powershell
+python -B .\run_realsense_grasp_workflow.py `
+  --arm-mode command `
+  --camera-to-base-translation-m "x,y,z" `
+  --camera-to-base-rotation "r11,r12,r13;r21,r22,r23;r31,r32,r33"
+```
+
+If `arm_command.json` says `status: not_reachable`, do not send it. Usually this means the camera extrinsic translation is not calibrated, the object is outside the 2-link workspace, or the firmware arm lengths do not match `--arm-l1-mm/--arm-l2-mm`.
+
+
+## Pick And Place
+
+The workflow can now generate a pick-and-place plan after the grasp pose is predicted.
+It writes `pick_place_plan.json` with ordered packets for motion and gripper control.
+
+Manual placement region, useful for debugging without another Qwen call:
+
+```powershell
+python -B .\run_realsense_grasp_workflow.py `
+  --frame-dir .\captures\realsense_20260609_194228 `
+  --options-json .\outputs\realsense_workflow\run_20260609_194200\qwen_options.json `
+  --choice B `
+  --place-mode manual `
+  --place-bbox "850,420,1050,620" `
+  --arm-mode command `
+  --no-vis
+```
+
+Qwen placement mode asks the vision model to propose three empty placement regions `P1/P2/P3` from an RGB-D context image:
+
+```powershell
+python -B .\run_realsense_grasp_workflow.py --place-mode qwen --max-place-options 3 --arm-mode command
+```
+
+Serial execution sends the generated sequence only when `pick_place_plan.json` is `ready_to_send`:
+
+```powershell
+python -B .\run_realsense_grasp_workflow.py --place-mode qwen --arm-mode serial --arm-port COM3 --no-vis
+```
+
+The firmware now supports:
 
 ```text
-<STOP>
+<C r;h;yaw;elbow>   # Cartesian arm motion
+<G angle>           # gripper servo angle, e.g. <G 60> open, <G 120> close
 ```
 
-相关代码在 `embodied_pick/robot.py`：
+If RealSense is not connected and you see `RuntimeError: No device connected`, use an existing capture folder for offline tests:
 
-- `JointAngles`：1-5 号电机角度结构体。
-- `SerialArmController.send_joint_angles()`：直接发送指定角度。
-- `SerialArmController._format_joint_angles()`：生成串口字符串。
-- `SerialArmController._plan_to_joint_angles()`：临时把抓取计划转换成关节角，后续应替换为真实逆运动学。
-
-当前配置：
-
-```json
-{
-  "robot_protocol": "joint_angles",
-  "robot_disabled_joints": [1],
-  "robot_home_angles": [90, 90, 90, 90, 90]
-}
+```powershell
+python -B .\run_realsense_grasp_workflow.py --frame-dir .\captures\realsense_20260609_194228 --arm-mode command --no-vis
 ```
-
 
 ## RealSense 一键抓取姿态流程
 

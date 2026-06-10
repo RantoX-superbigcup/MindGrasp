@@ -47,3 +47,5 @@ weights/**
 !weights/graspnet/
 !weights/graspnet/README.md
 !weights/graspnet/.gitkeep
+# Raw imported reference files
+files (3)/
