@@ -1,0 +1,52 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Local environment
+.venv/
+venv/
+.env
+.env.*
+configs/local_secrets*.json
+
+# Logs and runtime outputs
+*.log
+*.tmp
+runs/
+outputs/
+logs/
+checkpoints/
+
+# Build artifacts
+dist/
+build/
+*.spec
+
+# Large local model/data files
+*.pth
+*.pt
+*.ckpt
+*.tar
+*.onnx
+*.engine
+data/
+datasets/
+weights/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+~$*.doc
+~$*.docx
+# Keep weight directories documented, but do not commit binary checkpoints
+weights/**
+!weights/
+!weights/graspnet/
+!weights/graspnet/README.md
+!weights/graspnet/.gitkeep
+# Raw imported reference files
+files (3)/

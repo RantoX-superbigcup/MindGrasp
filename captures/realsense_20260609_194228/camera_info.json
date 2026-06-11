@@ -1,0 +1,52 @@
+{
+  "captured_at": "2026-06-09T19:42:28",
+  "device_name": "Intel RealSense D415",
+  "device_serial": "243722062659",
+  "stream_width": 1280,
+  "stream_height": 720,
+  "stream_fps": 30,
+  "realsense_options": {
+    "depth_preset": 3.0,
+    "emitter_enabled": 1.0,
+    "laser_power": 360.0,
+    "depth_auto_exposure": 1.0
+  },
+  "depth_filters": [
+    "threshold",
+    "spatial",
+    "temporal",
+    "hole_filling"
+  ],
+  "files": {
+    "color": "color.png",
+    "depth": "depth.png",
+    "workspace_mask": "workspace_mask.png",
+    "meta": "meta.mat"
+  },
+  "image_width": 1280,
+  "image_height": 720,
+  "intrinsic_matrix": [
+    [
+      908.3743896484375,
+      0.0,
+      631.127685546875
+    ],
+    [
+      0.0,
+      907.3345947265625,
+      379.5763854980469
+    ],
+    [
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "depth_scale_m_per_unit": 0.0010000000474974513,
+  "factor_depth": 999.9999389648438,
+  "min_depth_m": 0.3,
+  "max_depth_m": 1.2,
+  "workspace_mode": "valid",
+  "workspace_roi": null,
+  "note": "Depth is aligned to color. GraspNet reads depth_m = depth_png / factor_depth."
+}

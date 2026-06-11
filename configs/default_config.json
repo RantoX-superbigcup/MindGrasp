@@ -1,0 +1,16 @@
+{
+  "project_root": "..",
+  "graspnet_root": "third_party\\graspnet-baseline",
+  "graspnet_checkpoint": "weights\\graspnet\\checkpoint-rs.tar",
+  "qwen_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+  "qwen_model": "qwen3-vl-flash",
+  "qwen_api_key_env": "QWEN_API_KEY",
+  "robot_port": "COM3",
+  "robot_baudrate": 9600,
+  "robot_protocol": "joint_angles",
+  "robot_disabled_joints": [1],
+  "robot_home_angles": [90, 90, 90, 90, 90],
+  "dry_run": true,
+  "collision_thresh": 0.01,
+  "top_k_grasps": 10
+}
