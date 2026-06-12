@@ -25,6 +25,7 @@ checkpoints/
 dist/
 build/
 *.spec
+!python_demo.spec
 
 # Large local model/data files
 *.pth

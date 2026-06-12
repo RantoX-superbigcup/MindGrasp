@@ -66,15 +66,20 @@ def call_qwen_readable_options(
     model: str,
     api_key: str,
     max_options: int,
+    excluded_targets: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     import requests
     from PIL import Image
 
     width, height = Image.open(rgb_path).size
     key_text = "/".join(chr(ord("A") + i) for i in range(max_options))
+    excluded_targets = [str(item).strip() for item in (excluded_targets or []) if str(item).strip()]
+    exclude_text = ""
+    if excluded_targets:
+        exclude_text = "\n本轮必须排除这些上一轮已经展示过、用户表示不要的目标或同义物体：" + "、".join(excluded_targets[:24]) + "。不要再次输出它们。\n"
     prompt = f"""
 你是具身抓取系统的目标选择界面生成器。请观察图片，列出桌面上清晰、独立、可抓取的物体，最多 {max_options} 个。
-这些选项会给病人/操作者选择，所以必须可读、清楚、容易区分。
+这些选项会给病人/操作者选择，所以必须可读、清楚、容易区分。{exclude_text}
 
 请只输出严格 JSON，不要输出 Markdown，不要解释。图像宽高 width={width}, height={height}。
 每个 bbox 用原图像素坐标 [x1, y1, x2, y2]，仅用于界面预览；真正定位会由 GroundingDINO/SAM 完成。
@@ -101,7 +106,7 @@ JSON 格式：
 3. description 用中文，12-30 字，写清楚颜色、位置、形状或相邻参照物，例如“右侧红色饼干盒”“左下橙黑色电钻”。
 4. grounding_prompts 用 2-5 个英文短语，专门给 GroundingDINO 定位；不要只写自造 target_id。例：["green spiky toy", "toy case", "case"]、["black mug", "mug", "cup"]。
 5. 不要把同一个物体重复列出；不要列桌面、机械臂、背景、阴影。
-6. 如果画面中有 7 个可抓取物体，就输出 7 个，不要只输出 4 个。
+6. 如果 max_options=3，只输出最清楚的 3 个真实物体；不要输出“没有我想要的”，程序会自动添加 D 选项。
 """.strip()
     payload = {
         "model": model,
@@ -132,7 +137,7 @@ def normalize_readable_options(result: Dict[str, Any], width: int, height: int, 
         bbox = target_demo.normalize_bbox(option.get("bbox"), width, height)
         if bbox is None:
             continue
-        key = str(option.get("key") or chr(ord("A") + idx)).upper()[:1]
+        key = chr(ord("A") + len(normalized))
         label = str(option.get("label") or option.get("target_id") or f"目标{idx + 1}")
         target_id = str(option.get("target_id") or label).lower().replace(" ", "_")
         normalized_option = {
@@ -797,7 +802,7 @@ def main() -> None:
     parser.add_argument("--workflow-output-dir", default="outputs/realsense_workflow")
     parser.add_argument("--choice", help="Target option key. If omitted, ask interactively after Qwen options are shown.")
     parser.add_argument("--options-json", help="Reuse saved options JSON instead of calling Qwen.")
-    parser.add_argument("--max-options", type=int, default=8)
+    parser.add_argument("--max-options", type=int, default=3)
     parser.add_argument("--api-key-env", default="QWEN_API_KEY")
     parser.add_argument("--qwen-base-url")
     parser.add_argument("--qwen-model")

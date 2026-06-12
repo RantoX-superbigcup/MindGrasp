@@ -1,4 +1,4 @@
-# IntentGrasp
+# MindGrasp
 
 脑机接口引导的具身机械臂抓取框架。当前版本采用分层架构：Qwen-VL 负责场景理解和 A/B/C/D 选项生成，脑机接口负责选择，GraspNet 负责抓取候选，规划器负责轨迹，机械臂控制层负责串口执行。
 
@@ -11,7 +11,7 @@
 默认 `configs/default_config.json` 是全 dry-run，不会调用真实模型和机械臂：
 
 ```powershell
-cd "E:\IntentGrasp"
+cd "E:\graspBCI\MindGrasp"
 python -B .\run_embodied_demo.py --config .\configs\default_config.json --command E --pretty
 ```
 
@@ -28,7 +28,7 @@ python -B .\run_embodied_demo.py --config .\configs\default_config.json --comman
 如果只想真实调用 GraspNet，但 Qwen 和机械臂仍然保持模拟，使用：
 
 ```powershell
-cd "E:\IntentGrasp"
+cd "E:\graspBCI\MindGrasp"
 
 $env:CUDA_HOME="C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8"
 $env:CUDA_PATH=$env:CUDA_HOME
@@ -82,7 +82,7 @@ weights/graspnet/checkpoint-rs.tar
 建议把项目放在纯英文路径，例如：
 
 ```text
-E:\IntentGrasp
+E:\graspBCI\MindGrasp
 ```
 
 中文路径下 `nvcc + ninja + PyTorch C++ extension` 容易出现乱码路径和 `.obj` 生成失败。
@@ -140,7 +140,7 @@ setx QWEN_API_KEY "你的 API Key"
 如果只想验证“先识别可选物体，再只显示/输出目标物体的抓取姿态”，不要启用 BCI 和机械臂，使用独立脚本：
 
 ```powershell
-cd "E:\IntentGrasp"
+cd "E:\graspBCI\MindGrasp"
 
 $env:QWEN_API_KEY="你的 API Key"
 $env:CUDA_HOME="C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8"
@@ -421,7 +421,7 @@ RealSense 采集 RGB-D
 运行：
 
 ```powershell
-cd "E:\IntentGrasp"
+cd "E:\graspBCI\MindGrasp"
 conda activate uno
 $env:QWEN_API_KEY="你的 API Key"
 python -B .\run_realsense_grasp_workflow.py
@@ -513,3 +513,58 @@ python -B .\run_realsense_grasp_workflow.py --choice A
 5. 加入目标 bbox/mask 过滤，实现“选哪个物品就抓哪个”。
 6. 标定相机坐标系、机械臂坐标系和关节零位。
 7. 用逆运动学替换 `_plan_to_joint_angles()`，再做真实抓取。
+
+## HybridBCI 四选项交互约定
+
+当前 GUI 面向 HybridBCI/SSVEP 的 A/B/C/D 四类指令做了门控状态机：
+
+1. 目标选择页只显示 `A/B/C` 三个 Qwen 生成的可抓取目标，`D` 固定为“没有我想要的”。如果选择 `D`，GUI 会用同一帧 RGB 图重新调用 Qwen，并把上一轮出现过的目标加入排除列表，避免重复出现。
+2. 选择某个目标后不会立刻抓取，而是进入确认页：`A=重试`、`B=停止`、`C=确认`、`D=干扰项`。只有选择 `C` 后才会进入 GroundingDINO/SAM、GraspNet 和机械臂串口链路。
+3. 确认后运行期间会显示急停监控页：`A=急停`，`B/C/D=干扰项`。选择急停后还会进入二次确认页，避免误触。
+4. GUI 只在真正展示可选项时打开脑机在线识别门控；其它采集、推理、停止状态都会把门控切到 stop。当前门控状态会写入 `outputs/platform_grasp/bci_gate.json`，并在连接平台时通过 socket 发送 `mindgrasp_bci_gate` 消息，便于 Hybrid 平台按需开始/停止在线识别。
+
+## Windows 打包
+
+平台联调用 `package.bat` 生成 `dist\python_demo\python_demo.exe`。日常跨电脑使用也推荐“薄包 + 目标电脑 `MINDGRASP_PYTHON` 环境”；只有最终展示电脑不方便配环境时，才运行 `package_portable.bat` 生成便携包。详细说明见 `docs/PACKAGING.md`。
+## 打包策略：薄包优先，便携包兜底
+
+日常开发和平台联调不要每次打包整个 `uno` 环境。默认使用薄包：
+
+```powershell
+cd "E:\graspBCI\MindGrasp"
+.\package.bat
+```
+
+薄包输出位置：
+
+```text
+dist/python_demo/python_demo.exe
+```
+
+薄包只负责 GUI、平台 IPC、A/B/C/D 选项状态机和流程调度；真实的 Qwen、GraspNet、GroundingDINO、SAM、RealSense、Open3D、机械臂串口等依赖，优先调用目标电脑上已经配置好的 Python 环境。
+
+目标电脑只需要配置一次环境变量：
+
+```powershell
+setx MINDGRASP_PYTHON "D:\anaconda\envs\uno\python.exe"
+```
+
+把路径换成目标电脑自己的 conda 环境路径。设置后重新打开平台或终端，再启动 `python_demo.exe`。以后代码更新时，通常只需要重新打薄包，不需要重新打 8GB 的运行环境。
+
+运行时 Python 查找顺序：
+
+```text
+MINDGRASP_PYTHON 指定的目标电脑环境
+-> 随包 runtime/python/python.exe，如果存在
+-> 系统 python
+```
+
+只有在最终演示电脑不方便安装依赖，或者希望拷过去尽量少配置时，才使用便携发布包：
+
+```powershell
+.\package_portable.bat
+```
+
+便携包会把当前 `uno` 环境一起放进 `dist/python_demo/runtime/python/`，体积可能达到数 GB。给别人时必须复制整个 `dist/python_demo` 文件夹，不能只复制单个 `python_demo.exe`。
+
+推荐团队协作方式：开发阶段上传/分发薄包和源码；目标电脑按依赖说明配置自己的 Python 环境。最终答辩或展示前，再视情况生成一次便携包。

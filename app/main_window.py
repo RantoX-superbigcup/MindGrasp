@@ -29,6 +29,19 @@ from PyQt5.QtWidgets import (
 
 from ipc_socket.tcp_socket_client import HNNKTcpSocketClient
 from app.titile_bar import CustomTitleBar
+from app.interaction_state import (
+    CAPTURING_STAGE,
+    CONFIRM_SELECTION_STAGE,
+    EMERGENCY_CONFIRM_STAGE,
+    EMERGENCY_STAGE,
+    OBJECT_SELECTION_STAGE,
+    STOPPED_STAGE,
+    build_platform_object_options,
+    collect_exclusion_terms,
+    confirm_options,
+    emergency_confirm_options,
+    emergency_options,
+)
 from qwen_config import ensure_qwen_environment, resolve_qwen_base_url, resolve_qwen_model
 
 
@@ -37,6 +50,7 @@ DEMO_FRAME_DIR = PROJECT_ROOT / "third_party" / "graspnet-baseline" / "doc" / "e
 DEFAULT_OPTIONS_JSON = PROJECT_ROOT / "outputs" / "target_grasp" / "qwen_options.json"
 PLATFORM_OUTPUT_DIR = PROJECT_ROOT / "outputs" / "platform_grasp"
 REALSENSE_OPTIONS_DIR = PROJECT_ROOT / "outputs" / "realsense_frontend"
+BCI_GATE_STATE_PATH = PLATFORM_OUTPUT_DIR / "bci_gate.json"
 for local_source in [
     PROJECT_ROOT / "third_party" / "GroundingDINO",
     PROJECT_ROOT / "third_party" / "segment-anything",
@@ -74,14 +88,54 @@ def command_to_choice(result: Any) -> Optional[str]:
     return match.group(0) if match else None
 
 
+def app_base_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return PROJECT_ROOT
+
+
+def prepare_portable_runtime(runtime_python: Path) -> None:
+    runtime_root = runtime_python.parent
+    unpacker = runtime_root / "Scripts" / "conda-unpack.exe"
+    if not unpacker.exists():
+        return
+
+    marker = runtime_root / ".mindgrasp_runtime_ready"
+    runtime_path = str(runtime_root.resolve())
+    try:
+        if marker.exists() and marker.read_text(encoding="utf-8").strip() == runtime_path:
+            return
+        subprocess.run(
+            [str(unpacker)],
+            cwd=str(runtime_root),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        marker.write_text(runtime_path, encoding="utf-8")
+    except Exception as exc:
+        print(f"prepare_portable_runtime failed: {exc}")
+
+
 def python_executable() -> str:
     configured = os.getenv("MINDGRASP_PYTHON", "").strip()
     if configured:
         return configured
-    if getattr(sys, "frozen", False):
-        return "python"
-    return sys.executable
 
+    if getattr(sys, "frozen", False):
+        base_dir = app_base_dir()
+        portable_candidates = [
+            base_dir / "runtime" / "python" / "python.exe",
+            base_dir / "runtime" / "python.exe",
+            base_dir / "python" / "python.exe",
+        ]
+        for candidate in portable_candidates:
+            if candidate.exists():
+                prepare_portable_runtime(candidate)
+                return str(candidate)
+        return "python"
+
+    return sys.executable
 
 def run_target_grasp_in_process(argv: List[str]) -> str:
     import run_target_grasp_demo as target_demo
@@ -348,6 +402,10 @@ class GraspRunWorker(QThread):
         self.frame_dir = frame_dir
         self.options_json = options_json
         self.output_root = output_root
+        self.cancel_requested = False
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
 
     def run(self) -> None:
         output_dir = self.output_root / f"choice_{self.choice.lower()}"
@@ -389,26 +447,23 @@ class GraspRunWorker(QThread):
 
         self.status.emit("正在运行 GroundingDINO/SAM -> GraspNet ...")
         try:
-            if getattr(sys, "frozen", False):
-                stdout_text = run_target_grasp_in_process(cmd[3:])
-            else:
-                creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-                proc = subprocess.run(
-                    cmd,
-                    cwd=str(PROJECT_ROOT),
-                    env=env,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=600,
-                    creationflags=creationflags,
-                )
-                if proc.returncode != 0:
-                    message = (proc.stderr or proc.stdout or "").strip()
-                    self.failed.emit(message[-4000:] if message else f"process failed with code {proc.returncode}")
-                    return
-                stdout_text = proc.stdout or ""
+            creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            proc = subprocess.run(
+                cmd,
+                cwd=str(PROJECT_ROOT),
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=600,
+                creationflags=creationflags,
+            )
+            if proc.returncode != 0:
+                message = (proc.stderr or proc.stdout or "").strip()
+                self.failed.emit(message[-4000:] if message else f"process failed with code {proc.returncode}")
+                return
+            stdout_text = proc.stdout or ""
         except Exception as exc:
             self.failed.emit(str(exc))
             return
@@ -420,8 +475,37 @@ class GraspRunWorker(QThread):
 
         pose_overlay = create_pose_overlay(summary_path, output_dir, self.frame_dir)
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        if self.cancel_requested:
+            self.finished.emit(
+                {
+                    "choice": self.choice,
+                    "output_dir": str(output_dir),
+                    "summary_path": str(summary_path),
+                    "pose_overlay": str(pose_overlay) if pose_overlay else "",
+                    "target_overlay": str(output_dir / "target_overlay.png"),
+                    "summary": summary,
+                    "cancelled": True,
+                    "stdout_tail": stdout_text[-2000:],
+                }
+            )
+            return
         self.status.emit("正在转换机械臂指令并连接串口 ...")
         arm_output = build_legacy_arm_command(summary, output_dir)
+        if self.cancel_requested:
+            self.finished.emit(
+                {
+                    "choice": self.choice,
+                    "output_dir": str(output_dir),
+                    "summary_path": str(summary_path),
+                    "pose_overlay": str(pose_overlay) if pose_overlay else "",
+                    "target_overlay": str(output_dir / "target_overlay.png"),
+                    "summary": summary,
+                    "arm_output": arm_output,
+                    "cancelled": True,
+                    "stdout_tail": stdout_text[-2000:],
+                }
+            )
+            return
         arm_execution = execute_legacy_arm_command(arm_output, output_dir)
         self.finished.emit(
             {
@@ -509,8 +593,9 @@ class RealSensePrepareWorker(QThread):
                 resolve_qwen_base_url(),
                 resolve_qwen_model(),
                 api_key,
-                int(os.getenv("MINDGRASP_MAX_OPTIONS", "8")),
+                int(os.getenv("MINDGRASP_MAX_OBJECT_OPTIONS", "3")),
             )
+            options_result = build_platform_object_options(options_result)
             if not options_result.get("options"):
                 self.failed.emit("当前画面没有生成可选目标。请把相机对准桌面物体后重新采集。")
                 return
@@ -532,6 +617,53 @@ class RealSensePrepareWorker(QThread):
             self.failed.emit(str(exc))
 
 
+class QwenOptionsWorker(QThread):
+    status = pyqtSignal(str)
+    finished = pyqtSignal(dict)
+    failed = pyqtSignal(str)
+
+    def __init__(self, frame_dir: Path, excluded_options: List[Dict[str, Any]], parent=None):
+        super().__init__(parent)
+        self.frame_dir = frame_dir
+        self.excluded_options = list(excluded_options)
+
+    def run(self) -> None:
+        try:
+            if str(PROJECT_ROOT) not in sys.path:
+                sys.path.insert(0, str(PROJECT_ROOT))
+            from run_realsense_grasp_workflow import call_qwen_readable_options
+            import run_target_grasp_demo as target_demo
+
+            api_key = ensure_qwen_environment("QWEN_API_KEY")
+            if not api_key:
+                self.failed.emit("缺少 QWEN_API_KEY 或 configs/local_secrets.json，无法重新识别目标选项。")
+                return
+
+            excluded_terms = collect_exclusion_terms(self.excluded_options)
+            self.status.emit("正在重新识别目标，并排除上一组选项 ...")
+            raw_options = call_qwen_readable_options(
+                self.frame_dir / "color.png",
+                resolve_qwen_base_url(),
+                resolve_qwen_model(),
+                api_key,
+                int(os.getenv("MINDGRASP_MAX_OBJECT_OPTIONS", "3")),
+                excluded_targets=excluded_terms,
+            )
+            options_result = build_platform_object_options(raw_options, excluded_terms=excluded_terms)
+            if not options_result.get("options"):
+                self.failed.emit("重新识别后没有生成可选目标。")
+                return
+
+            REALSENSE_OPTIONS_DIR.mkdir(parents=True, exist_ok=True)
+            stem = datetime.now().strftime("%Y%m%d_%H%M%S")
+            options_json = REALSENSE_OPTIONS_DIR / f"qwen_options_retry_{stem}.json"
+            options_json.write_text(json.dumps({"qwen_options": options_result}, ensure_ascii=False, indent=2), encoding="utf-8")
+            target_demo.draw_options_overlay(self.frame_dir / "color.png", options_result, REALSENSE_OPTIONS_DIR / f"qwen_options_retry_overlay_{stem}.png")
+            self.finished.emit({"options_json": str(options_json), "options_result": options_result, "excluded_terms": excluded_terms})
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -548,12 +680,21 @@ class MainWindow(QMainWindow):
         self.output_root = PLATFORM_OUTPUT_DIR
         if self.frame_dir != DEMO_FRAME_DIR:
             self.output_root = PLATFORM_OUTPUT_DIR / f"realsense_{self.frame_dir.name}"
-        self.options_result = read_options_file(self.options_json_path)
+        self.options_result = build_platform_object_options(read_options_file(self.options_json_path))
+        self.object_options_result = self.options_result
+        self.previous_object_options_result: Optional[Dict[str, Any]] = None
+        self.pending_choice: Optional[str] = None
+        self.pending_option: Optional[Dict[str, Any]] = None
+        self.excluded_object_options: List[Dict[str, Any]] = []
+        self.bci_active = False
+        self.workflow_stopped = False
+        self.interaction_stage = OBJECT_SELECTION_STAGE
         self.option_buttons: Dict[str, QPushButton] = {}
         self.image_labels: Dict[str, QLabel] = {}
         self.current_choice: Optional[str] = None
         self.grasp_worker: Optional[GraspRunWorker] = None
         self.realsense_worker: Optional[RealSensePrepareWorker] = None
+        self.options_worker: Optional[QThread] = None
         self.log_lines: List[str] = []
 
         self.init_ui()
@@ -829,7 +970,7 @@ class MainWindow(QMainWindow):
         pose_path = self.default_pose_overlay_path()
         if pose_path:
             self.set_image("pose", pose_path)
-        self.render_options()
+        self.show_object_options(self.options_result, activate_bci=True, reason="initial_options")
         self.log("平台在线输出入口: ipc_algorithm_test -> result_args.data")
         missing = self.missing_formal_chain_parts()
         if missing:
@@ -875,9 +1016,86 @@ class MainWindow(QMainWindow):
             button.setToolTip(desc)
             button.setMinimumHeight(58)
             button.setStyleSheet(self.option_button_style(selected=False))
+            if option.get("enabled", True) is False:
+                button.setEnabled(False)
             button.clicked.connect(lambda _checked=False, selected_key=key: self.select_target(selected_key, "本地按钮"))
             self.option_buttons[key] = button
             self.option_grid.addWidget(button, idx // 2, idx % 2)
+
+    def persist_current_options(self) -> None:
+        try:
+            self.options_json_path.parent.mkdir(parents=True, exist_ok=True)
+            self.options_json_path.write_text(json.dumps({"qwen_options": self.options_result}, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as exc:
+            self.log(f"保存选项文件失败: {exc}")
+
+    def publish_bci_gate(self, active: bool, reason: str = "") -> None:
+        payload = {
+            "msg": "mindgrasp_bci_gate",
+            "active": bool(active),
+            "mode": "online" if active else "stop",
+            "stage": self.interaction_stage,
+            "reason": reason,
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+        }
+        try:
+            BCI_GATE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            BCI_GATE_STATE_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as exc:
+            self.log(f"写入 BCI gate 状态失败: {exc}")
+        if self.connect_status:
+            try:
+                self.client_socket.send_to_server(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+            except Exception as exc:
+                self.log(f"发送 BCI gate 状态失败: {exc}")
+
+    def set_bci_gate(self, active: bool, reason: str = "") -> None:
+        self.bci_active = bool(active)
+        self.publish_bci_gate(active, reason)
+        self.log(f"BCI gate -> {'online' if active else 'stop'} ({self.interaction_stage}; {reason})")
+
+    def show_object_options(self, options_result: Dict[str, Any], activate_bci: bool, reason: str) -> None:
+        self.interaction_stage = OBJECT_SELECTION_STAGE
+        self.options_result = build_platform_object_options(options_result, collect_exclusion_terms(self.excluded_object_options))
+        self.object_options_result = self.options_result
+        self.current_choice = None
+        self.workflow_stopped = False
+        self.render_options()
+        self.persist_current_options()
+        self.set_badge(self.selection_badge, "当前选择", "待选择")
+        self.set_badge(self.chain_badge, "链路", "等待选择")
+        self.set_badge(self.result_badge, "结果", "未运行")
+        self.status_label.setText("请选择目标 A/B/C；如果没有想要的目标请选择 D。")
+        self.set_bci_gate(activate_bci, reason)
+
+    def show_confirm_options(self) -> None:
+        self.interaction_stage = CONFIRM_SELECTION_STAGE
+        self.options_result = confirm_options()
+        self.current_choice = None
+        self.render_options()
+        label = self.pending_option.get("label", self.pending_choice) if self.pending_option else self.pending_choice
+        self.set_badge(self.selection_badge, "待确认", f"{self.pending_choice} {label}")
+        self.set_badge(self.chain_badge, "链路", "等待确认")
+        self.set_badge(self.result_badge, "结果", "未运行")
+        self.status_label.setText(f"已选择 {self.pending_choice}: {label}。请选择 A 重试、B 停止、C 确认。")
+        self.set_bci_gate(True, "confirm_options_ready")
+
+    def show_emergency_options(self) -> None:
+        self.interaction_stage = EMERGENCY_STAGE
+        self.options_result = emergency_options()
+        self.current_choice = None
+        self.render_options()
+        self.set_badge(self.chain_badge, "链路", "运行中")
+        self.status_label.setText("已确认目标并开始运行。运行期间仅急停选项会触发中断，其余为干扰项。")
+        self.set_bci_gate(True, "emergency_options_ready")
+
+    def show_emergency_confirm_options(self) -> None:
+        self.interaction_stage = EMERGENCY_CONFIRM_STAGE
+        self.options_result = emergency_confirm_options()
+        self.current_choice = None
+        self.render_options()
+        self.status_label.setText("已选择急停。请选择 A 确认急停，或 B 取消。")
+        self.set_bci_gate(True, "emergency_confirm_ready")
 
     def set_image(self, name: str, path: Path):
         label = self.image_labels.get(name)
@@ -910,7 +1128,12 @@ class MainWindow(QMainWindow):
             return
 
         self.capture_button.setEnabled(False)
+        self.interaction_stage = CAPTURING_STAGE
+        self.set_bci_gate(False, "capturing_realsense")
         self.current_choice = None
+        self.pending_choice = None
+        self.pending_option = None
+        self.excluded_object_options = []
         self.update_option_styles()
         self.set_badge(self.selection_badge, "当前选择", "等待相机")
         self.set_badge(self.chain_badge, "链路", "采集中")
@@ -935,16 +1158,15 @@ class MainWindow(QMainWindow):
         self.set_image("rgb", self.frame_dir / "color.png")
         self.pose_overlay_label.clear()
         self.pose_overlay_label.setText("请选择目标")
-        self.render_options()
-        self.set_badge(self.selection_badge, "当前选择", "待选择")
+        self.show_object_options(self.options_result, activate_bci=True, reason="realsense_options_ready")
         self.set_badge(self.chain_badge, "链路", "RealSense 就绪")
-        self.set_badge(self.result_badge, "结果", "未运行")
-        self.status_label.setText(f"RealSense 已采集: {self.frame_dir.name}。请选择目标 A/B/C/D。")
+        self.status_label.setText(f"RealSense 已采集: {self.frame_dir.name}。请选择目标 A/B/C；没有想要的目标选 D。")
         self.log(f"RealSense frame_dir={self.frame_dir}")
         self.log(f"options_json={self.options_json_path}")
 
     def on_realsense_failed(self, message: str):
         self.capture_button.setEnabled(True)
+        self.set_bci_gate(False, "realsense_failed")
         self.set_badge(self.chain_badge, "链路", "采集失败")
         self.set_badge(self.result_badge, "结果", "未运行")
         self.status_label.setText(message)
@@ -956,28 +1178,144 @@ class MainWindow(QMainWindow):
             self.status_label.setText(f"收到无效指令: {choice}")
             self.log(f"忽略无效指令: {choice}")
             return
-        if self.grasp_worker is not None and self.grasp_worker.isRunning():
-            self.log("已有抓取流程正在运行，当前指令被忽略")
-            return
 
+        self.set_bci_gate(False, f"received_{choice}")
+        option = self.get_option(choice)
+        action = str(option.get("action", "select_target")) if option else "noop"
         self.current_choice = choice
         self.update_option_styles()
-        option = self.get_option(choice)
-        label = option.get("label", choice) if option else choice
-        self.status_label.setText(f"{source} 选择 {choice}: {label}，准备运行正式定位/分割链路")
-        self.set_badge(self.selection_badge, "当前选择", f"{choice} {label}")
-        self.set_badge(self.chain_badge, "链路", "运行中")
-        self.set_badge(self.result_badge, "结果", "等待输出")
-        self.log(f"选择目标 {choice}: {label}")
+        self.log(f"{source} 指令 {choice}: action={action}, stage={self.interaction_stage}")
 
+        if action == "noop":
+            self.status_label.setText(f"{source} 选择 {choice}: 干扰/占位选项，不执行动作。")
+            self.set_bci_gate(True, "noop_keep_options")
+            return
+        if self.interaction_stage == OBJECT_SELECTION_STAGE:
+            self.handle_object_choice(choice, option, source)
+        elif self.interaction_stage == CONFIRM_SELECTION_STAGE:
+            self.handle_confirm_choice(action, source)
+        elif self.interaction_stage == EMERGENCY_STAGE:
+            self.handle_emergency_choice(action, source)
+        elif self.interaction_stage == EMERGENCY_CONFIRM_STAGE:
+            self.handle_emergency_confirm_choice(action, source)
+        else:
+            self.log(f"当前阶段 {self.interaction_stage} 不接受指令 {choice}")
+
+    def handle_object_choice(self, choice: str, option: Optional[Dict[str, Any]], source: str) -> None:
+        if not option:
+            self.status_label.setText(f"未找到选项: {choice}")
+            self.set_bci_gate(True, "missing_option")
+            return
+        action = str(option.get("action", "select_target"))
+        if action == "none_of_these":
+            self.excluded_object_options.extend(self.object_options_result.get("options", []))
+            self.start_qwen_retry()
+            return
+        self.pending_choice = choice
+        self.pending_option = option
+        self.previous_object_options_result = self.object_options_result
+        label = option.get("label", choice)
+        self.log(f"选择候选目标 {choice}: {label}，进入确认页")
+        self.show_confirm_options()
+
+    def handle_confirm_choice(self, action: str, source: str) -> None:
+        if action == "retry":
+            self.options_result = self.previous_object_options_result or self.object_options_result
+            self.show_object_options(self.options_result, activate_bci=True, reason="retry_restore_options")
+            self.status_label.setText("已返回上一组目标选项，请重新选择。")
+            return
+        if action == "stop":
+            self.stop_workflow("user_stop")
+            return
+        if action == "confirm":
+            self.confirm_and_run()
+            return
+        self.set_bci_gate(True, "confirm_keep_options")
+
+    def handle_emergency_choice(self, action: str, source: str) -> None:
+        if action == "emergency_request":
+            self.show_emergency_confirm_options()
+            return
+        self.status_label.setText("急停监控页：当前选择为干扰项，流程继续。")
+        self.set_bci_gate(True, "emergency_distractor")
+
+    def handle_emergency_confirm_choice(self, action: str, source: str) -> None:
+        if action == "confirm_emergency":
+            self.stop_workflow("emergency_stop", emergency=True)
+            return
+        if action == "cancel_emergency":
+            self.show_emergency_options()
+            return
+        self.status_label.setText("急停确认页：当前选择为干扰项，请选择 A 确认或 B 取消。")
+        self.set_bci_gate(True, "emergency_confirm_distractor")
+
+    def start_qwen_retry(self) -> None:
+        if self.options_worker is not None and self.options_worker.isRunning():
+            self.log("重新识别正在进行，忽略重复请求")
+            return
+        self.interaction_stage = CAPTURING_STAGE
+        self.set_bci_gate(False, "retry_recognition")
+        self.set_badge(self.selection_badge, "当前选择", "重新识别")
+        self.set_badge(self.chain_badge, "链路", "Qwen 重试")
+        self.status_label.setText("正在重新识别目标，并排除上一组选项 ...")
+        self.options_worker = QwenOptionsWorker(self.frame_dir, self.excluded_object_options, self)
+        self.options_worker.status.connect(self.status_label.setText)
+        self.options_worker.finished.connect(self.on_qwen_retry_ready)
+        self.options_worker.failed.connect(self.on_qwen_retry_failed)
+        self.options_worker.start()
+
+    def on_qwen_retry_ready(self, result: Dict[str, Any]) -> None:
+        self.options_json_path = Path(result["options_json"])
+        self.options_result = result["options_result"]
+        self.log("已排除: " + ", ".join(result.get("excluded_terms", [])[:12]))
+        self.show_object_options(self.options_result, activate_bci=True, reason="retry_options_ready")
+
+    def on_qwen_retry_failed(self, message: str) -> None:
+        self.set_badge(self.chain_badge, "链路", "重试失败")
+        self.status_label.setText(message)
+        self.log(message)
+        self.show_object_options(self.object_options_result, activate_bci=True, reason="retry_failed_restore")
+
+    def confirm_and_run(self) -> None:
+        if not self.pending_choice:
+            self.status_label.setText("没有待确认目标，请重新选择。")
+            self.show_object_options(self.object_options_result, activate_bci=True, reason="confirm_without_target")
+            return
         missing = self.missing_formal_chain_parts()
         if missing:
             self.status_label.setText("GroundingDINO/SAM 正式链路未就绪，不能进入 GraspNet")
             self.set_badge(self.chain_badge, "链路", "未就绪")
             self.set_badge(self.result_badge, "结果", "缺依赖")
             self.log("缺少: " + "; ".join(missing))
+            self.show_confirm_options()
             return
-        self.run_formal_grasp(choice)
+        label = self.pending_option.get("label", self.pending_choice) if self.pending_option else self.pending_choice
+        self.current_choice = self.pending_choice
+        self.workflow_stopped = False
+        self.set_badge(self.selection_badge, "已确认", f"{self.pending_choice} {label}")
+        self.set_badge(self.result_badge, "结果", "等待输出")
+        self.show_emergency_options()
+        self.run_formal_grasp(self.pending_choice)
+
+    def stop_workflow(self, reason: str, emergency: bool = False) -> None:
+        self.workflow_stopped = True
+        self.interaction_stage = STOPPED_STAGE
+        self.set_bci_gate(False, reason)
+        if self.grasp_worker is not None and self.grasp_worker.isRunning():
+            self.grasp_worker.cancel()
+        self.pending_choice = None
+        self.pending_option = None
+        self.current_choice = None
+        if self.object_options_result:
+            self.options_result = self.object_options_result
+            self.render_options()
+        self.update_option_styles()
+        self.set_badge(self.selection_badge, "当前选择", "已停止")
+        self.set_badge(self.chain_badge, "链路", "停止")
+        self.set_badge(self.result_badge, "结果", "已停止")
+        label = "急停已触发" if emergency else "流程已停止"
+        self.status_label.setText(f"{label}。BCI 在线识别已关闭，后续不会继续下发机械臂动作。")
+        self.log(f"stop_workflow: {reason}, emergency={emergency}")
 
     def run_formal_grasp(self, choice: str):
         self.grasp_worker = GraspRunWorker(choice, self.frame_dir, self.options_json_path, self.output_root, self)
@@ -987,30 +1325,14 @@ class MainWindow(QMainWindow):
         self.grasp_worker.start()
 
     def on_grasp_finished(self, result: Dict[str, Any]):
-        summary = result.get("summary", {})
-        top_grasps = summary.get("top_grasps", [])
-        target_grasps = summary.get("target_grasps", 0)
-        if result.get("pose_overlay"):
-            self.set_image("pose", Path(result["pose_overlay"]))
-        elif result.get("target_overlay"):
-            self.set_image("pose", Path(result["target_overlay"]))
-
-        if top_grasps:
-            top = top_grasps[0]
-            position = top.get("translation", [])
-            score = float(top.get("score", 0.0) or 0.0)
-            self.status_label.setText(f"抓取姿态已生成: target_grasps={target_grasps}, top_score={score:.3f}")
-            self.set_badge(self.chain_badge, "链路", "完成")
-            self.set_badge(self.result_badge, "结果", f"{target_grasps} 个候选")
-            self.log(f"top grasp position={position}, width={top.get('width')}, score={score:.3f}")
-        else:
-            self.status_label.setText("流程完成，但没有筛选到目标抓取姿态")
-            self.set_badge(self.chain_badge, "链路", "完成")
-            self.set_badge(self.result_badge, "结果", "0 个候选")
-            self.log("target_grasps=0")
-        self.log(f"输出目录: {result.get('output_dir')}")
-
-    def on_grasp_finished(self, result: Dict[str, Any]):
+        if result.get("cancelled") or self.workflow_stopped:
+            self.set_bci_gate(False, "grasp_cancelled")
+            self.set_badge(self.chain_badge, "链路", "已停止")
+            self.set_badge(self.result_badge, "结果", "已取消")
+            self.status_label.setText("流程已停止，未继续下发机械臂动作。")
+            self.log(f"抓取流程取消，输出目录: {result.get('output_dir')}")
+            return
+        self.set_bci_gate(False, "grasp_finished")
         summary = result.get("summary", {})
         top_grasps = summary.get("top_grasps", [])
         target_grasps = summary.get("target_grasps", 0)
@@ -1050,6 +1372,7 @@ class MainWindow(QMainWindow):
         return f"机械臂未发送: {reason}, packet={packet}"
 
     def on_grasp_failed(self, message: str):
+        self.set_bci_gate(False, "grasp_failed")
         self.status_label.setText("正式链路运行失败")
         self.set_badge(self.chain_badge, "链路", "失败")
         self.set_badge(self.result_badge, "结果", "错误")
@@ -1120,6 +1443,7 @@ class MainWindow(QMainWindow):
         self.disconnect_button.setEnabled(True)
         self.connect_status_label.setText("状态: 已连接")
         self.set_badge(self.chain_badge, "链路", "平台连接")
+        self.publish_bci_gate(self.bci_active, "platform_connected")
         self.log("已连接平台")
 
     def on_server_disconnected(self):
@@ -1142,6 +1466,10 @@ class MainWindow(QMainWindow):
             result = ipc_json_data["result_args"]["data"]
             choice = command_to_choice(result)
             self.log(f"平台指令: {result}")
+            if not self.bci_active:
+                self.log(f"BCI gate 已关闭，忽略平台指令: {result}")
+                self.publish_bci_gate(False, "ignored_command_gate_closed")
+                return
             if choice:
                 self.select_target(choice, "平台")
             else:
